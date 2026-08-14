@@ -151,6 +151,60 @@ class TransformerReplayBuffer(object):
         q_targets = torch.as_tensor(self.q_target[idxs//400, idxs%400], device=self.device).float()
 
         return env_obs, actions, rewards, next_env_obs, mus, log_stds, q_targets, env_indices, task_encoding
+
+    def sample_multi_step(self, horizon, index=None, device=None):
+        """Sample a current state together with the next `horizon` transitions."""
+        device = self.device if device is None else device
+        if index is None:
+            idxs = self.sample_indices()
+        else:
+            idxs = np.asarray(index)
+
+        horizon = max(int(horizon), 1)
+        ep_len = 400
+
+        episode_ids = idxs // ep_len
+        timesteps = idxs % ep_len
+        future_offsets = np.arange(horizon)[None, :]
+        future_timesteps = timesteps[:, None] + future_offsets
+        within_episode = future_timesteps < ep_len
+        future_timesteps = np.clip(future_timesteps, 0, ep_len - 1)
+
+        current_states = torch.as_tensor(
+            self.env_obses[episode_ids, timesteps], device=device
+        ).float()
+        action_seq = torch.as_tensor(
+            self.actions[episode_ids[:, None], future_timesteps], device=device
+        ).float()
+        reward_seq = torch.as_tensor(
+            self.rewards[episode_ids[:, None], future_timesteps], device=device
+        ).float()
+        next_state_seq = torch.as_tensor(
+            self.next_env_obses[episode_ids[:, None], future_timesteps], device=device
+        ).float()
+        env_indices = torch.as_tensor(
+            self.task_obs[episode_ids, timesteps], device=device
+        )
+        task_encoding = torch.as_tensor(
+            self.task_encodings[episode_ids, timesteps], device=device
+        ).float()
+
+        not_done_seq = torch.as_tensor(
+            self.not_dones[episode_ids[:, None], future_timesteps], device=device
+        ).float()
+        within_episode = torch.as_tensor(
+            within_episode, device=device, dtype=torch.float32
+        ).unsqueeze(-1)
+        carry_mask = torch.cat(
+            [
+                torch.ones((len(idxs), 1, 1), device=device, dtype=torch.float32),
+                torch.cumprod(not_done_seq[:, :-1], dim=1),
+            ],
+            dim=1,
+        )
+        valid_mask = within_episode * carry_mask
+
+        return current_states, action_seq, reward_seq, next_state_seq, valid_mask, env_indices, task_encoding
     
     def build_sequences_for_indices(self, idxs, seq_len, device=None):
 
@@ -378,11 +432,25 @@ class TransformerReplayBuffer(object):
                 actions[start:end] = payload[2][:select_till_index]
                 rewards[start:end] = payload[3][:select_till_index]
                 not_dones[start:end] = payload[4][:select_till_index]
-                task_encodings[start:end] = payload[5][:select_till_index]
-                task_obs[start:end] = payload[6][:select_till_index]
-                policy_mu[start:end] = payload[7][:select_till_index]
-                policy_log_std[start:end] = payload[8][:select_till_index]
-                q_target[start:end] = payload[9][:select_till_index]
+
+                # Support two on-disk layouts:
+                # 1) TransformerReplayBuffer (len=10):
+                #    [env_obs, next_env_obs, action, reward, not_done, task_encoding, task_obs, mu, log_std, q_target]
+                # 2) DistilledReplayBuffer (len=9):
+                #    [env_obs, next_env_obs, action, reward, not_done, task_obs, mu, log_std, q_target]
+                if len(payload) >= 10:
+                    task_encodings[start:end] = payload[5][:select_till_index]
+                    task_obs[start:end] = payload[6][:select_till_index]
+                    policy_mu[start:end] = payload[7][:select_till_index]
+                    policy_log_std[start:end] = payload[8][:select_till_index]
+                    q_target[start:end] = payload[9][:select_till_index]
+                else:
+                    task_obs[start:end] = payload[5][:select_till_index]
+                    policy_mu[start:end] = payload[6][:select_till_index]
+                    policy_log_std[start:end] = payload[7][:select_till_index]
+                    q_target[start:end] = payload[8][:select_till_index]
+                    # DistilledReplayBuffer has no task-encoding field.
+                    task_encodings[start:end] = 0.0
                 self.idx = end # removed - 1
                 start = end
                 print(f"Loaded transformer replay buffer from path: {path})")
@@ -421,6 +489,7 @@ class TransformerReplayBuffer(object):
 
     def load_multiple_buffer(self, save_dirs):
         start = 0
+        self.source_ranges = {}
 
         if self.compressed_state:
             env_obses = np.empty((self.capacity, 21), dtype=np.float32)
@@ -437,6 +506,7 @@ class TransformerReplayBuffer(object):
         q_target = np.empty((self.capacity, 1), dtype=np.float32)
 
         for save_dir in save_dirs:
+            dir_start = start
             chunks = os.listdir(save_dir)
             chunks = sorted(chunks, key=lambda x: int(x.split("_")[0]))
             for chunk in chunks:
@@ -461,11 +531,19 @@ class TransformerReplayBuffer(object):
                     actions[start:end] = payload[2][:select_till_index]
                     rewards[start:end] = payload[3][:select_till_index]
                     not_dones[start:end] = payload[4][:select_till_index]
-                    task_encodings[start:end] = payload[5][:select_till_index]
-                    task_obs[start:end] = payload[6][:select_till_index]
-                    policy_mu[start:end] = payload[7][:select_till_index]
-                    policy_log_std[start:end] = payload[8][:select_till_index]
-                    q_target[start:end] = payload[9][:select_till_index]
+
+                    if len(payload) >= 10:
+                        task_encodings[start:end] = payload[5][:select_till_index]
+                        task_obs[start:end] = payload[6][:select_till_index]
+                        policy_mu[start:end] = payload[7][:select_till_index]
+                        policy_log_std[start:end] = payload[8][:select_till_index]
+                        q_target[start:end] = payload[9][:select_till_index]
+                    else:
+                        task_obs[start:end] = payload[5][:select_till_index]
+                        policy_mu[start:end] = payload[6][:select_till_index]
+                        policy_log_std[start:end] = payload[7][:select_till_index]
+                        q_target[start:end] = payload[8][:select_till_index]
+                        task_encodings[start:end] = 0.0
                     self.idx = end # removed - 1
                     start = end
                     print(f"Loaded transformer replay buffer from path: {path})")
@@ -473,6 +551,12 @@ class TransformerReplayBuffer(object):
                     print(
                         f"Skipping loading transformer replay buffer from path: {path} due to error: {e}"
                     )
+            if start > dir_start:
+                self.source_ranges[str(save_dir)] = {
+                    "start": dir_start,
+                    "end": start,
+                    "size": start - dir_start,
+                }
         if self.normalize_rewards:
             self.max_reward = np.max(rewards[:self.idx])
             self.min_reward = np.min(rewards[:self.idx])
@@ -498,4 +582,3 @@ class TransformerReplayBuffer(object):
     def reset(self):
         self.idx = 0
         self.idx_sample = 0
-

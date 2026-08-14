@@ -60,6 +60,9 @@ def build_metaworld_vec_env(
         "num_copies_per_env": 1,
         # "num_copies_per_env": 8,
         "should_perform_reward_normalization": True,
+        "obs_noise_std": float(getattr(config.experiment, "obs_noise_std", 0.0)),
+        "action_delay_steps": int(getattr(config.experiment, "action_delay_steps", 0)),
+        "action_noise_std": float(getattr(config.experiment, "action_noise_std", 0.0)),
     }
 
     funcs_to_make_envs, env_id_to_task_map = get_list_of_func_to_make_metaworld_envs(
@@ -95,6 +98,9 @@ def build_metaworld_vec_env_col(
         "env_id_to_task_map": env_id_to_task_map,
         "num_copies_per_env": 1,
         "should_perform_reward_normalization": True,
+        "obs_noise_std": float(getattr(config.experiment, "obs_noise_std", 0.0)),
+        "action_delay_steps": int(getattr(config.experiment, "action_delay_steps", 0)),
+        "action_noise_std": float(getattr(config.experiment, "action_noise_std", 0.0)),
     }
 
     funcs_to_make_envs, env_id_to_task_map = get_list_of_func_to_make_metaworld_envs(
@@ -133,6 +139,9 @@ def build_metaworld_env_list(
         "env_id_to_task_map": env_id_to_task_map,
         "num_copies_per_env": 1,
         "should_perform_reward_normalization": True,
+        "obs_noise_std": float(getattr(config.experiment, "obs_noise_std", 0.0)),
+        "action_delay_steps": int(getattr(config.experiment, "action_delay_steps", 0)),
+        "action_noise_std": float(getattr(config.experiment, "action_noise_std", 0.0)),
     }
 
     envs_list, env_id_to_task_map = get_list_of_envs(**make_kwargs)
@@ -162,6 +171,9 @@ def build_metaworld_env_list_col(
         "env_id_to_task_map": env_id_to_task_map,
         "num_copies_per_env": 1,
         "should_perform_reward_normalization": True,
+        "obs_noise_std": float(getattr(config.experiment, "obs_noise_std", 0.0)),
+        "action_delay_steps": int(getattr(config.experiment, "action_delay_steps", 0)),
+        "action_noise_std": float(getattr(config.experiment, "action_noise_std", 0.0)),
     }
 
     envs_list, env_id_to_task_map = get_list_of_envs(**make_kwargs)

@@ -45,6 +45,7 @@ train:
     [wm_duration, WM/DUR, time, average],
     [predictive_adapter_dynamics_loss, WM/DynLoss, float, average],
     [predictive_adapter_reward_loss, WM/RwdLoss, float, average],
+    [predictive_adapter_delta_state_loss, WM/DeltaLoss, float, average],
     [predictive_adapter_total_loss, WM/Total, float, average],
     
   ]
@@ -61,6 +62,7 @@ eval:
     [batch_reward_agent_index_, AGENT_, float, average],
     [avg_dynamics_loss, WM/DynLoss, float, average],
     [avg_reward_loss, WM/RwdLoss, float, average],
+    [avg_delta_state_loss, WM/DeltaLoss, float, average],
     [avg_total_loss, WM/Total, float, average],
   ]
 col_train:

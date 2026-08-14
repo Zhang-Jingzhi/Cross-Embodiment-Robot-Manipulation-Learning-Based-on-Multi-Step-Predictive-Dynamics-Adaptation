@@ -1269,19 +1269,29 @@ class Experiment(collective_experiment.Experiment):
         for step in range(self.pa_start_step, exp_config.num_pa_train_step):
             
             # === 1. Core training step ===
+            delta_pair_batches = self.sample_pa_delta_pair_batches()
             self.col_agent.train_predictive_adapter(
-                self.replay_buffer_distill, self.logger, step, tb_log=True
+                self.replay_buffer_distill,
+                self.logger,
+                step,
+                tb_log=True,
+                delta_pair_batches=delta_pair_batches,
             )
             self.pa_start_step += 1
 
             # === 2. Periodic evaluation and early stopping logic ===
             if step > 0 and step % exp_config.pa_eval_freq == 0 and has_validation_buffer:
                 print(f"\n--- Running periodic pa evaluation at step {step} ---")
+                val_delta_pair_batches = self.sample_pa_delta_pair_batches(
+                    replay_buffer=self.replay_buffer_val,
+                    pair_specs=getattr(self, "pa_val_task_pair_specs", {}),
+                )
                 
                 # Run evaluation (Note: evaluate_predictive_adapter must handle model.eval() and model.train() switching internally)
                 avg_val_losses = self.col_agent.evaluate_predictive_adapter(
                     validation_buffer=self.replay_buffer_val,
-                    batch_size=self.config.replay_buffer.transformer_col_replay_buffer.batch_size
+                    batch_size=self.config.replay_buffer.transformer_col_replay_buffer.batch_size,
+                    delta_pair_batches=val_delta_pair_batches,
                 )
                 
                 if avg_val_losses:

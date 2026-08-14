@@ -106,6 +106,44 @@ class Experiment(collective_learning.Experiment):
                     current_id += 1
         return env_id_to_index_map
 
+    def _get_eval_step_limit(self) -> int:
+        limit = int(getattr(self.config.experiment, "eval_episode_step_limit", 0) or 0)
+        if limit <= 0:
+            return self.max_episode_steps
+        return min(limit, self.max_episode_steps)
+
+    def _cap_eval_history(
+        self,
+        state_buffer: torch.Tensor,
+        action_buffer: torch.Tensor,
+        reward_buffer: torch.Tensor,
+        episode_step: int,
+    ):
+        history_cap = int(getattr(self.config.experiment, "eval_history_steps", 0) or 0)
+        if history_cap <= 0:
+            return state_buffer, action_buffer, reward_buffer
+
+        state_cap = max(min(history_cap, state_buffer.shape[1]), 1)
+        ar_cap = max(min(history_cap - 1, action_buffer.shape[1]), 0)
+
+        capped_states = state_buffer.clone()
+        capped_actions = action_buffer.clone()
+        capped_rewards = reward_buffer.clone()
+
+        if state_cap < state_buffer.shape[1]:
+            pad_state = state_buffer[:, -1:, :].expand(-1, state_buffer.shape[1] - state_cap, -1)
+            capped_states[:, : state_buffer.shape[1] - state_cap, :] = pad_state
+
+        if ar_cap < action_buffer.shape[1]:
+            if ar_cap == 0:
+                capped_actions.zero_()
+                capped_rewards.zero_()
+            else:
+                capped_actions[:, : action_buffer.shape[1] - ar_cap, :] = 0.0
+                capped_rewards[:, : reward_buffer.shape[1] - ar_cap, :] = 0.0
+
+        return capped_states, capped_actions, capped_rewards
+
     def evaluate_vec_env_of_tasks(self, vec_env: VecEnv, step: int, episode: int, agent: str = "worker"):
         """Evaluate the agent's performance on the different environments,
         vectorized as a single instance of vectorized environment.
@@ -130,7 +168,8 @@ class Experiment(collective_learning.Experiment):
         
         multitask_obs = vec_env.reset()  # (num_envs, 9, 84, 84)
 
-        while episode_step < self.max_episode_steps:
+        step_limit = self._get_eval_step_limit()
+        while episode_step < step_limit:
             # --- Timing checkpoint 1: Policy/Inference phase (CPU Prep + GPU Inference) ---
             t0 = time.time()
 
@@ -237,16 +276,23 @@ class Experiment(collective_learning.Experiment):
         # Cache Task IDs
         task_ids_tensor = torch.tensor(self.task_num[self.env_indices_i], device=device)
 
-        while episode_step < self.max_episode_steps:
+        step_limit = self._get_eval_step_limit()
+        while episode_step < step_limit:
             # Initialize current step's Action Numpy array (keeping original logic)
             action_np = np.full(shape=(B, action_dim), fill_value=0.)
             
             # === 2. Inference (using Buffer slices) ===
             with agent_utils.eval_mode(agent):
+                capped_states, capped_actions, capped_rewards = self._cap_eval_history(
+                    state_buffer,
+                    action_buffer,
+                    reward_buffer,
+                    episode_step=episode_step,
+                )
                 # Slicing: State takes full length, Action/Reward takes last T-1 entries (corresponds to original T-1)
-                active_states = state_buffer[self.env_indices]
-                active_actions = action_buffer[self.env_indices, 1:, :]
-                active_rewards = reward_buffer[self.env_indices, 1:, :]
+                active_states = capped_states[self.env_indices]
+                active_actions = capped_actions[self.env_indices, 1:, :]
+                active_rewards = capped_rewards[self.env_indices, 1:, :]
 
                 if sample_actions:
                     action_out = agent.sample_action(
@@ -356,7 +402,8 @@ class Experiment(collective_learning.Experiment):
 
         #TODO: improve evaluate_unused
         action = np.full(shape=(vec_env.num_envs, np.prod(self.action_space.shape)), fill_value=0.)
-        while episode_step < self.max_episode_steps:
+        step_limit = self._get_eval_step_limit()
+        while episode_step < step_limit:
 
             with agent_utils.eval_mode(self.col_agent):
                 action[self.env_indices] = self.col_agent.select_action(

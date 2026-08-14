@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader, random_split
 import numpy as np
 import time
 import math
+import argparse
 from dataset_tf import TFDataset
 import os
 from InfoNceLoss import InfoNCE
@@ -1190,7 +1191,7 @@ bnpy_epochs = 1
 
 contrastive_temp = 0.15  #0.25
 contrastive_loss_weight = 0.25
-use_own_contrastive_loss = False
+use_own_contrastive_loss = True
 use_task_arm = False
 cluster_state = False
 
@@ -1202,7 +1203,7 @@ use_decoupling_loss = False  # Enable task-robot subspace decoupling
 decoupling_loss_weight = 0.1  # Weight for decoupling loss
 
 # Dynamic loss configuration for future state prediction
-use_dynamic_loss = False  # Enable dynamic loss to predict next state (predictive adapter style)
+use_dynamic_loss = True  # Enable dynamic loss to predict next state (predictive adapter style)
 dynamic_loss_weight = 200  # Weight for dynamic loss
 dynamic_hidden_dim = 128  # Hidden dimension for dynamic prediction head
 
@@ -1291,6 +1292,64 @@ np.load = logged_np_load
 ######################################################################
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train the representation transformer used by PACE.")
+    parser.add_argument("--epochs", type=int, default=epochs)
+    parser.add_argument("--batch-size", type=int, default=batch_size)
+    parser.add_argument("--learning-rate", type=float, default=learning_rate)
+    parser.add_argument("--sequence-len", type=int, default=sequence_len)
+    parser.add_argument("--seed", type=int, default=seed)
+    parser.add_argument("--model-path", default=model_path)
+    parser.add_argument("--train-dataset-path", default=dataset_path)
+    parser.add_argument("--val-dataset-path", default=val_dataset_path)
+    parser.add_argument("--embeddings-path", default=embeddings_path)
+    parser.add_argument("--log-path", default=log_path)
+    parser.add_argument("--predict-samples-num", type=int, default=predict_samples_num)
+    parser.add_argument("--embedding-num", type=int, default=embedding_num)
+    parser.add_argument("--bnpy-epochs", type=int, default=bnpy_epochs)
+    parser.add_argument(
+        "--fresh-start",
+        action="store_true",
+        help="Ignore any existing checkpoint and train from scratch.",
+    )
+    parser.add_argument(
+        "--skip-bnpy",
+        action="store_true",
+        help="Skip bnpy clustering after training.",
+    )
+    parser.add_argument(
+        "--skip-embedding-eval",
+        action="store_true",
+        help="Skip embedding export/evaluation after training.",
+    )
+    parser.add_argument(
+        "--skip-last-state-eval",
+        action="store_true",
+        help="Skip final last-state prediction evaluation.",
+    )
+    args = parser.parse_args()
+
+    batch_size = args.batch_size
+    learning_rate = args.learning_rate
+    epochs = args.epochs
+    sequence_len = args.sequence_len
+    predict_samples_num = args.predict_samples_num
+    bnpy_epochs = args.bnpy_epochs
+    seed = args.seed
+    embedding_num = args.embedding_num
+    model_path = args.model_path
+    dataset_path = args.train_dataset_path
+    val_dataset_path = args.val_dataset_path
+    embeddings_path = args.embeddings_path
+    log_path = args.log_path
+    should_continue = should_continue and (not args.fresh_start)
+    train_bnpy = train_bnpy and (not args.skip_bnpy)
+    evaluate_embedding = evaluate_embedding and (not args.skip_embedding_eval)
+    should_predict_last_state = should_predict_last_state and (not args.skip_last_state_eval)
+
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    os.makedirs(log_path, exist_ok=True)
+    os.makedirs(os.path.dirname(embeddings_path), exist_ok=True)
+
     # Set initial seed for reproducibility
     set_seed(seed)
 

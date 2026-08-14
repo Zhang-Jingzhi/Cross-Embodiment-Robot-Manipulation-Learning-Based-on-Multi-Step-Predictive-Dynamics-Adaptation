@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export PROJECT_ROOT
+
+RUN_SAVE_DIR="${RUN_SAVE_DIR:-${PROJECT_ROOT}/logs/task_dyn_true_singlestep_seed5_20260325_153611}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(basename "${RUN_SAVE_DIR}")}"
+SOURCE_EXPERIMENT_NAME="${SOURCE_EXPERIMENT_NAME:-${EXPERIMENT_NAME}}"
+SEED="${SEED:-5}"
+MODE="${MODE:-robot_joint_damping}"
+CALIBRATION_TAG="${CALIBRATION_TAG:-$(date +%Y%m%d_%H%M)}"
+EXPERIMENT_SUFFIX="${EXPERIMENT_SUFFIX:-calibv2_${CALIBRATION_TAG}}"
+TARGET_ROBOTS="${TARGET_ROBOTS:-panda,kuka,ur5e,viperx}"
+TARGET_ROBOT="${TARGET_ROBOT:-}"
+TARGET_TASK="${TARGET_TASK:-}"
+SAVE_VIDEO="${SAVE_VIDEO:-False}"
+CASE_RETRIES="${CASE_RETRIES:-2}"
+
+case "${MODE}" in
+  robot_joint_damping)
+    VALUES_DEFAULT="1.0,2.0,3.0,4.0,5.0"
+    ;;
+  robot_joint_armature)
+    VALUES_DEFAULT="1.0,2.0,4.0,6.0,8.0"
+    ;;
+  robot_body_mass)
+    VALUES_DEFAULT="1.0,1.5,2.0,2.5,3.0"
+    ;;
+  *)
+    echo "Unsupported MODE=${MODE}. Use robot_joint_damping, robot_joint_armature, or robot_body_mass." >&2
+    exit 1
+    ;;
+esac
+
+VALUES="${VALUES:-${VALUES_DEFAULT}}"
+ANALYSIS_DIR="${ANALYSIS_DIR:-${RUN_SAVE_DIR}/analysis/${MODE}_${EXPERIMENT_SUFFIX}}"
+
+echo "PROJECT_ROOT=${PROJECT_ROOT}"
+echo "RUN_SAVE_DIR=${RUN_SAVE_DIR}"
+echo "EXPERIMENT_NAME=${EXPERIMENT_NAME}"
+echo "SOURCE_EXPERIMENT_NAME=${SOURCE_EXPERIMENT_NAME}"
+echo "SEED=${SEED}"
+echo "MODE=${MODE}"
+echo "VALUES=${VALUES}"
+echo "CALIBRATION_TAG=${CALIBRATION_TAG}"
+echo "EXPERIMENT_SUFFIX=${EXPERIMENT_SUFFIX}"
+echo "TARGET_ROBOTS=${TARGET_ROBOTS}"
+echo "TARGET_ROBOT=${TARGET_ROBOT}"
+echo "TARGET_TASK=${TARGET_TASK}"
+echo "ANALYSIS_DIR=${ANALYSIS_DIR}"
+echo "CASE_RETRIES=${CASE_RETRIES}"
+
+RUN_SAVE_DIR="${RUN_SAVE_DIR}" \
+EXPERIMENT_NAME="${EXPERIMENT_NAME}" \
+SOURCE_EXPERIMENT_NAME="${SOURCE_EXPERIMENT_NAME}" \
+SEED="${SEED}" \
+MODE="${MODE}" \
+VALUES="${VALUES}" \
+TARGET_ROBOTS="${TARGET_ROBOTS}" \
+TARGET_ROBOT="${TARGET_ROBOT}" \
+TARGET_TASK="${TARGET_TASK}" \
+ANALYSIS_DIR="${ANALYSIS_DIR}" \
+SAVE_VIDEO="${SAVE_VIDEO}" \
+EXPERIMENT_SUFFIX="${EXPERIMENT_SUFFIX}" \
+CASE_RETRIES="${CASE_RETRIES}" \
+bash "${PROJECT_ROOT}/scripts/run_eval_robot_dynamics_sweep.sh"

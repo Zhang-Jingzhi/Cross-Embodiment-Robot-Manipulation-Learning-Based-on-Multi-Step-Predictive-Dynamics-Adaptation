@@ -45,6 +45,11 @@ evaluate_transformer: "agent" #"collective_network" # collective_network / agent
 evaluate_episodes: 100
 evaluate_critic_rounds: 5
 recording_eval_episodes: 1
+eval_history_steps: 0 # 0 means full context; positive values cap the visible history during eval
+eval_episode_step_limit: 0 # 0 means use env max steps; positive values truncate evaluation rollouts
+obs_noise_std: 0.0
+action_delay_steps: 0
+action_noise_std: 0.0
 
 latent_clustering_num: 1
 col_eval_freq: 1000 #150

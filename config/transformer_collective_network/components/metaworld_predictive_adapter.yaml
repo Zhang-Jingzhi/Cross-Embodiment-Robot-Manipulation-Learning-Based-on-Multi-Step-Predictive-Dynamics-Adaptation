@@ -19,6 +19,14 @@ simnorm_dim: 8
 
 # Predictive adapter training parameters
 reward_bounds: [-10, 10]  # Min/max reward for discretization
+rollout_horizon: 5
+rollout_discount: 1.0
+dynamics_loss_weight: 200.0
+reward_loss_weight: 1.0
+delta_state_loss_weight: 0.1
+delta_state_similarity_temperature: 0.1
+delta_state_num_task_pairs: 4
+delta_state_pair_batch_size: 128
 
 pretrained_dir: "${project_root}/logs/experiment_test/model_dir"  # Directory where the world model was saved during training
 pretrained_step: null                                      # Specify an integer step; null means auto-find metadata or latest

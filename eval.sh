@@ -18,6 +18,11 @@
 
 set -euo pipefail
 
+# Project root: default to the directory containing this script.
+# Can still be overridden by exporting PROJECT_ROOT manually.
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+export PROJECT_ROOT
+
 ### ===================== Configurable Variables ===================== ###
 # Experiment name — controls which experiment model directory is used.
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-task_dyn_true}"
@@ -28,6 +33,13 @@ SEED="${SEED:-3}"
 # Transformer model path — override the default representation transformer checkpoint.
 # If empty, the default path from the config YAML will be used.
 TRANSFORMER_PATH="${TRANSFORMER_PATH:-"${PROJECT_ROOT}/Transformer_RNN/checkpoints_task_dyn_true_seed_3/representation_cls_transformer_checkpoint.pth"}"
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+    PYTHON_BIN="${PYTHON_BIN}"
+elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+    PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+else
+    PYTHON_BIN="python"
+fi
 
 SCRIPT_EXTRA_ARGS=()
 EVAL_ROBOT=""
@@ -88,7 +100,7 @@ evaluate_col_agent(){
     mkdir -p "$log_dir"
     local log_file="${log_dir}/eval_${robot_type}_seed_${SEED}.log"
 
-    python3 -u main.py \
+    "$PYTHON_BIN" -u main.py \
         setup=metaworld \
         env=metaworld-mt1 \
         worker.multitask.num_envs=1 \
@@ -115,7 +127,7 @@ evaluate_expert(){
     local result_path="${PROJECT_ROOT}/logs/results/worker/${task_name}"
     mkdir -p "$(dirname "$result_path")"
 
-    python3 -u main.py \
+    "$PYTHON_BIN" -u main.py \
         setup=metaworld \
         env=metaworld-mt1 \
         worker.multitask.num_envs=1 \
@@ -139,7 +151,7 @@ evaluate_predictive_adapter(){
     fi
 
     echo "=== Evaluating predictive adapter ==="
-    python3 -u main.py \
+    "$PYTHON_BIN" -u main.py \
         setup=metaworld \
         env=metaworld-mt1 \
         worker.multitask.num_envs=1 \
@@ -166,6 +178,9 @@ print_results(){
 
 mkdir -p ${PROJECT_ROOT}/logs/results/worker
 mkdir -p ${PROJECT_ROOT}/logs/results/col
+mkdir -p "${PROJECT_ROOT}/logs/results/worker"
+mkdir -p "${PROJECT_ROOT}/logs/results/col"
+echo "Using python interpreter: ${PYTHON_BIN}"
 
 if [[ -n "$EVAL_ROBOT" && -n "$EVAL_TASK" ]]; then
     # Evaluate specific robot + task

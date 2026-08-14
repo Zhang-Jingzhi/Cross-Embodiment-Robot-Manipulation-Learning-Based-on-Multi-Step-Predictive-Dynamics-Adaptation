@@ -5,6 +5,7 @@ import numpy as np
 import sys, os
 import re
 import gc
+import argparse
 
 import re
 from pathlib import Path
@@ -38,7 +39,7 @@ class TFDataset(Dataset):
         # Ensure that the input lists have the same length
         assert len(self.states) == len(self.actions) == len(self.rewards), "All input lists must have the same length."
         assert len(self.task_obs) == len(self.task_arm), "Task_obs and task arm must match"
-        assert len(self.states) >= self.sequence_length, "Not enough data to create even one sequence."
+        assert self.max_seq_len >= self.sequence_length, "Not enough time steps to create even one sequence."
 
     def __len__(self):
         # The number of valid sequences
@@ -191,6 +192,25 @@ np.load = logged_np_load
 ######################################################################
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Build transformer datasets from distilled replay buffers.")
+    parser.add_argument(
+        "--input-root",
+        default=None,
+        help="Directory containing train/ and validation/ subdirectories with split replay buffers.",
+    )
+    parser.add_argument(
+        "--output-root",
+        default=None,
+        help="Directory where serialized transformer datasets will be written.",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--sequence-length", type=int, default=5)
+    parser.add_argument("--max-num-states", type=int, default=2200)
+    parser.add_argument("--max-sequence-length", type=int, default=400)
+    parser.add_argument("--drop-first-percentage", type=float, default=0.25)
+    parser.add_argument("--drop-minimum-samples", type=int, default=1000)
+    args = parser.parse_args()
+
     # Environment configuration
     sys.path.append(os.path.abspath(os.path.join('..', 'mtrl')))
     from mtrl.col_replay_buffer import DistilledReplayBuffer
@@ -198,20 +218,20 @@ if __name__ == "__main__":
     project_root = os.environ.get("PROJECT_ROOT")
     if not project_root:
         raise ValueError("PROJECT_ROOT environment variable is not set.")
-    
-    path_data = os.path.join(project_root, "Transformer_RNN/dataset_3/")
+
+    path_data = args.input_root or os.path.join(project_root, "Transformer_RNN/dataset_3/")
     # Root output directory
-    base_safe_path = os.path.join(project_root, 'Transformer_RNN/decision_tf_dataset_3/')
+    base_safe_path = args.output_root or os.path.join(project_root, "Transformer_RNN/decision_tf_dataset_3/")
     subdicts = ['train', 'validation'] # Removed slashes for easier path concatenation
 
     # Experiment hyperparameters
-    seed = 0
+    seed = args.seed
     np.random.seed(seed)
-    sequence_length = 5
-    max_num_states = 2200
-    max_sequence_length = 400
-    drop_first_percentage = 0.25
-    drop_minimum_samples = 1000
+    sequence_length = args.sequence_length
+    max_num_states = args.max_num_states
+    max_sequence_length = args.max_sequence_length
+    drop_first_percentage = args.drop_first_percentage
+    drop_minimum_samples = args.drop_minimum_samples
 
     print(f"🚀 Creating dataset | Max samples: {max_num_states} | Seq length: {sequence_length} | Seed: {seed}")
 

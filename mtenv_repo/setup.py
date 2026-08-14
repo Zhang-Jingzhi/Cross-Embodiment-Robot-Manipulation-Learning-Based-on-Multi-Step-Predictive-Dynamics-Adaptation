@@ -1,8 +1,10 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 # type: ignore
 import codecs
+import os
 import os.path
 import subprocess
+import sys
 from pathlib import Path
 
 import setuptools
@@ -25,7 +27,8 @@ def get_version(rel_path):
 def parse_dependency(filepath):
     dep_list = []
     for dep in open(filepath).read().splitlines():
-        if dep.startswith("#"):
+        dep = dep.strip()
+        if not dep or dep.startswith("#"):
             continue
         key = "#egg="
         if key in dep:
@@ -43,8 +46,22 @@ extras_require = {}
 
 for setup_path in Path("mtenv/envs").glob("**/setup.py"):
     env_path = setup_path.parent
+    repo_root = str(Path(__file__).resolve().parent)
+    child_env = os.environ.copy()
+    # Subpackage setup scripts import mtenv utilities; ensure repo root is importable.
+    child_env["PYTHONPATH"] = (
+        repo_root
+        if not child_env.get("PYTHONPATH")
+        else f"{repo_root}:{child_env['PYTHONPATH']}"
+    )
     env_name = (
-        subprocess.run(["python", setup_path, "--name"], stdout=subprocess.PIPE)
+        subprocess.run(
+            [sys.executable, str(setup_path), "--name"],
+            stdout=subprocess.PIPE,
+            env=child_env,
+            cwd=repo_root,
+            check=True,
+        )
         .stdout.decode()
         .strip()
     )

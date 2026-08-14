@@ -16,6 +16,11 @@ from functools import wraps
 
 # Environment variable name for robot type (persists across processes)
 _ROBOT_TYPE_ENV_VAR = "METAWORLD_ROBOT_TYPE"
+_DYNAMICS_VARIANT_ROBOTS_ENV_VAR = "METAWORLD_DYNAMICS_VARIANT_ROBOTS"
+_BODY_MASS_SCALE_ENV_VAR = "METAWORLD_ROBOT_BODY_MASS_SCALE"
+_JOINT_DAMPING_SCALE_ENV_VAR = "METAWORLD_ROBOT_JOINT_DAMPING_SCALE"
+_JOINT_ARMATURE_SCALE_ENV_VAR = "METAWORLD_ROBOT_JOINT_ARMATURE_SCALE"
+_DYNAMICS_VARIANT_TAG_ENV_VAR = "METAWORLD_DYNAMICS_VARIANT_TAG"
 
 # Flag to track if patches have been applied in this process
 _PATCHES_APPLIED = False
@@ -49,6 +54,34 @@ def get_robot_type() -> str | None:
     return os.environ.get(_ROBOT_TYPE_ENV_VAR)
 
 
+def _parse_dynamics_variant_spec(robot_type: str | None):
+    if not robot_type:
+        return None
+
+    target_robots = os.environ.get(_DYNAMICS_VARIANT_ROBOTS_ENV_VAR, "").strip()
+    if target_robots:
+        allowed = {item.strip() for item in target_robots.split(",") if item.strip()}
+        if allowed and robot_type not in allowed:
+            return None
+
+    body_mass_scale = float(os.environ.get(_BODY_MASS_SCALE_ENV_VAR, "1.0") or 1.0)
+    joint_damping_scale = float(os.environ.get(_JOINT_DAMPING_SCALE_ENV_VAR, "1.0") or 1.0)
+    joint_armature_scale = float(os.environ.get(_JOINT_ARMATURE_SCALE_ENV_VAR, "1.0") or 1.0)
+    variant_tag = os.environ.get(_DYNAMICS_VARIANT_TAG_ENV_VAR, "").strip()
+
+    from metaworld.envs.dynamics_variant_manager import DynamicsVariantSpec
+
+    spec = DynamicsVariantSpec(
+        body_mass_scale=body_mass_scale,
+        joint_damping_scale=joint_damping_scale,
+        joint_armature_scale=joint_armature_scale,
+        variant_tag=variant_tag,
+    )
+    if spec.is_identity():
+        return None
+    return spec
+
+
 def get_robot_specific_xml_path(env_name: str, default_xml_path: str) -> str:
     """Get robot-specific XML path, or fall back to default.
     
@@ -70,10 +103,27 @@ def get_robot_specific_xml_path(env_name: str, default_xml_path: str) -> str:
         return default_xml_path
     
     try:
-        from metaworld.envs.robot_config_manager import get_robot_xml_path
+        from metaworld.envs.dynamics_variant_manager import create_dynamics_variant_xml
+        from metaworld.envs.robot_config_manager import RobotConfigManager, get_robot_xml_path
         
         # Try to get or generate robot-specific XML
         robot_xml = get_robot_xml_path(env_name, robot_type, regenerate=False)
+        variant_spec = _parse_dynamics_variant_spec(robot_type)
+        if variant_spec is not None:
+            manager = RobotConfigManager()
+            base_xml = manager.get_robot_base_xml_path(robot_type)
+            robot_xml = create_dynamics_variant_xml(
+                task_xml_path=Path(robot_xml),
+                base_xml_path=base_xml,
+                spec=variant_spec,
+                regenerate=False,
+            )
+            print(
+                "[RobotConfig] Using dynamics-variant XML "
+                f"(body_mass={variant_spec.body_mass_scale}, "
+                f"joint_damping={variant_spec.joint_damping_scale}, "
+                f"joint_armature={variant_spec.joint_armature_scale}): {robot_xml}"
+            )
         
         if robot_xml.exists():
             print(f"[RobotConfig] Using {robot_type} XML for {env_name}: {robot_xml}")

@@ -159,11 +159,23 @@ class PredictiveAdapter(base_component.Component):
         simnorm_dim: int = 8,
         reward_bounds: Tuple[float, float] = (-10.0, 10.0),
         dropout: float = 0.0,
+        rollout_horizon: int = 1,
+        rollout_discount: float = 1.0,
+        dynamics_loss_weight: float = 200.0,
+        reward_loss_weight: float = 1.0,
+        delta_state_loss_weight: float = 0.0,
+        delta_state_similarity_temperature: float = 0.1,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.reward_bins = reward_bins
         self.task_encoding_dim = task_encoding_dim
+        self.rollout_horizon = max(int(rollout_horizon), 1)
+        self.rollout_discount = float(rollout_discount)
+        self.dynamics_loss_weight = float(dynamics_loss_weight)
+        self.reward_loss_weight = float(reward_loss_weight)
+        self.delta_state_loss_weight = float(delta_state_loss_weight)
+        self.delta_state_similarity_temperature = float(delta_state_similarity_temperature)
 
         # modules
         self.encoder = PredictiveAdapterEncoder(
@@ -226,7 +238,12 @@ class PredictiveAdapter(base_component.Component):
         if self.reward_bins <= 1:
             # Scalar regression (MSE)
             return logits if logits.ndim == 2 else logits.unsqueeze(-1)
-        return two_hot_inv(logits, self.dreg_cfg)  # [B,1]
+        return two_hot_inv(
+            logits,
+            self.dreg_cfg.num_bins,
+            self.dreg_cfg.vmin,
+            self.dreg_cfg.vmax,
+        )  # [B,1]
 
     def forward(self, state: TensorType, action: TensorType, task_encoding: TensorType):
         z = self.encode(state, task_encoding)
@@ -237,6 +254,8 @@ class PredictiveAdapter(base_component.Component):
     @torch.no_grad()
     def latent_rollout(self, z0: TensorType, actions: TensorType, task_encoding: TensorType) -> TensorType:
         """Multi-step latent rollout (for diagnostics)"""
+        if actions.dim() == 3:
+            actions = actions.transpose(0, 1)
         T = actions.shape[0]
         B = z0.shape[0]
         z = z0
@@ -248,29 +267,184 @@ class PredictiveAdapter(base_component.Component):
 
     # ---------- loss ----------
     def compute_loss(self, state: TensorType, action: TensorType, next_state: TensorType,
-                     reward: TensorType, task_encoding: TensorType):
+                     reward: TensorType, task_encoding: TensorType, valid_mask: Optional[TensorType] = None):
         """Return (dyn_loss, rew_loss, total_loss)"""
-        # 1) encode
-        z = self.encode(state, task_encoding)
-        with torch.no_grad():
-            z_next_tgt = self.encode(next_state, task_encoding)
+        if action.dim() == 2:
+            # 1) encode
+            z = self.encode(state, task_encoding)
+            with torch.no_grad():
+                z_next_tgt = self.encode(next_state, task_encoding)
 
-        # 2) Dynamics consistency
-        z_next_pred = self.predict_next_latent(z, action, task_encoding)
-        dyn_loss = F.mse_loss(z_next_pred, z_next_tgt)
+            # 2) Dynamics consistency
+            z_next_pred = self.predict_next_latent(z, action, task_encoding)
+            dyn_loss = F.mse_loss(z_next_pred, z_next_tgt)
 
-        # 3) Reward two-hot (or MSE when reward_bins=1)
-        logits = self.reward_logits(z, action, task_encoding)
-        if self.reward_bins > 1:
-            # Ensure shape is [B,1]
-            r = reward if reward.ndim == 2 else reward.unsqueeze(-1)
-            rew_loss = soft_ce(logits, r, self.dreg_cfg).mean()
+            # 3) Reward two-hot (or MSE when reward_bins=1)
+            logits = self.reward_logits(z, action, task_encoding)
+            if self.reward_bins > 1:
+                r = reward if reward.ndim == 2 else reward.unsqueeze(-1)
+                rew_loss = soft_ce(logits, r, self.dreg_cfg).mean()
+            else:
+                r = reward if reward.ndim == 2 else reward.unsqueeze(-1)
+                rew_loss = F.mse_loss(logits, r)
         else:
-            r = reward if reward.ndim == 2 else reward.unsqueeze(-1)
-            rew_loss = F.mse_loss(logits, r)
+            dyn_loss, rew_loss = self._compute_multi_step_loss(
+                state=state,
+                actions=action,
+                next_states=next_state,
+                rewards=reward,
+                task_encoding=task_encoding,
+                valid_mask=valid_mask,
+            )
 
-        total = 200*dyn_loss + rew_loss
+        total = self.dynamics_loss_weight * dyn_loss + self.reward_loss_weight * rew_loss
         return dyn_loss, rew_loss, total
+
+    def _compute_multi_step_loss(
+        self,
+        state: TensorType,
+        actions: TensorType,
+        next_states: TensorType,
+        rewards: TensorType,
+        task_encoding: TensorType,
+        valid_mask: Optional[TensorType] = None,
+    ) -> Tuple[TensorType, TensorType]:
+        """Compute a horizon-H rollout loss in latent space."""
+        batch_size, horizon = actions.shape[0], actions.shape[1]
+        device = state.device
+
+        if valid_mask is None:
+            valid_mask = torch.ones(batch_size, horizon, 1, device=device, dtype=state.dtype)
+        else:
+            valid_mask = valid_mask.to(device=device, dtype=state.dtype)
+            if valid_mask.dim() == 2:
+                valid_mask = valid_mask.unsqueeze(-1)
+
+        discount = torch.pow(
+            torch.full((horizon,), self.rollout_discount, device=device, dtype=state.dtype),
+            torch.arange(horizon, device=device, dtype=state.dtype),
+        ).view(1, horizon, 1)
+        weights = valid_mask * discount
+        normalizer = weights.sum().clamp_min(1.0)
+
+        z_roll = self.encode(state, task_encoding)
+        task_encoding_seq = task_encoding.unsqueeze(1).expand(-1, horizon, -1)
+
+        with torch.no_grad():
+            next_states_flat = next_states.reshape(batch_size * horizon, -1)
+            task_flat = task_encoding_seq.reshape(batch_size * horizon, -1)
+            z_targets = self.encode(next_states_flat, task_flat).view(batch_size, horizon, -1)
+
+        pred_latents = []
+        reward_logits = []
+        z_curr = z_roll
+        for step in range(horizon):
+            action_step = actions[:, step]
+            reward_logits.append(self.reward_logits(z_curr, action_step, task_encoding))
+            z_curr = self.predict_next_latent(z_curr, action_step, task_encoding)
+            pred_latents.append(z_curr)
+
+        pred_latents = torch.stack(pred_latents, dim=1)
+        reward_logits = torch.stack(reward_logits, dim=1)
+
+        dyn_per_step = F.mse_loss(pred_latents, z_targets, reduction="none").mean(dim=-1, keepdim=True)
+        dyn_loss = (dyn_per_step * weights).sum() / normalizer
+
+        if self.reward_bins > 1:
+            logits_flat = reward_logits.reshape(batch_size * horizon, -1)
+            rewards_flat = rewards.reshape(batch_size * horizon, 1)
+            rew_per_step = soft_ce(logits_flat, rewards_flat, self.dreg_cfg).view(batch_size, horizon, 1)
+        else:
+            rew_per_step = F.mse_loss(reward_logits, rewards, reduction="none").mean(dim=-1, keepdim=True)
+
+        rew_loss = (rew_per_step * weights).sum() / normalizer
+        return dyn_loss, rew_loss
+
+    @staticmethod
+    def _ensure_sequence_shape(
+        state: TensorType,
+        action: TensorType,
+        next_state: TensorType,
+        valid_mask: Optional[TensorType],
+    ) -> Tuple[TensorType, TensorType, TensorType, TensorType]:
+        if action.dim() == 2:
+            action = action.unsqueeze(1)
+        if next_state.dim() == 2:
+            next_state = next_state.unsqueeze(1)
+        if valid_mask is None:
+            valid_mask = torch.ones(
+                next_state.shape[0], next_state.shape[1], 1,
+                device=next_state.device, dtype=next_state.dtype
+            )
+        elif valid_mask.dim() == 2:
+            valid_mask = valid_mask.unsqueeze(-1)
+        prev_state = torch.cat([state.unsqueeze(1), next_state[:, :-1]], dim=1)
+        return prev_state, action, next_state, valid_mask
+
+    def compute_delta_state_similarity_loss(
+        self,
+        state_a: TensorType,
+        action_a: TensorType,
+        next_state_a: TensorType,
+        state_b: TensorType,
+        action_b: TensorType,
+        next_state_b: TensorType,
+        valid_mask_a: Optional[TensorType] = None,
+        valid_mask_b: Optional[TensorType] = None,
+    ) -> TensorType:
+        """
+        Align state-change sequences across different robots for the same task.
+        Samples are matched by action-sequence cosine similarity, then their
+        delta-state sequences are encouraged to be close in cosine space.
+        """
+        prev_a, action_a, next_state_a, valid_mask_a = self._ensure_sequence_shape(
+            state_a, action_a, next_state_a, valid_mask_a
+        )
+        prev_b, action_b, next_state_b, valid_mask_b = self._ensure_sequence_shape(
+            state_b, action_b, next_state_b, valid_mask_b
+        )
+
+        delta_a = (next_state_a - prev_a) * valid_mask_a
+        delta_b = (next_state_b - prev_b) * valid_mask_b
+        action_a = action_a * valid_mask_a
+        action_b = action_b * valid_mask_b
+
+        delta_feat_a = delta_a.reshape(delta_a.shape[0], -1)
+        delta_feat_b = delta_b.reshape(delta_b.shape[0], -1)
+        action_feat_a = action_a.reshape(action_a.shape[0], -1)
+        action_feat_b = action_b.reshape(action_b.shape[0], -1)
+
+        valid_rows_a = valid_mask_a.sum(dim=(1, 2)) > 0
+        valid_rows_b = valid_mask_b.sum(dim=(1, 2)) > 0
+        if valid_rows_a.sum() == 0 or valid_rows_b.sum() == 0:
+            return torch.zeros((), device=state_a.device, dtype=state_a.dtype)
+
+        delta_feat_a = delta_feat_a[valid_rows_a]
+        delta_feat_b = delta_feat_b[valid_rows_b]
+        action_feat_a = action_feat_a[valid_rows_a]
+        action_feat_b = action_feat_b[valid_rows_b]
+
+        action_feat_a = F.normalize(action_feat_a, p=2, dim=-1, eps=1e-8)
+        action_feat_b = F.normalize(action_feat_b, p=2, dim=-1, eps=1e-8)
+        delta_feat_a = F.normalize(delta_feat_a, p=2, dim=-1, eps=1e-8)
+        delta_feat_b = F.normalize(delta_feat_b, p=2, dim=-1, eps=1e-8)
+
+        temperature = max(self.delta_state_similarity_temperature, 1e-6)
+        action_sim = (action_feat_a @ action_feat_b.t()) / temperature
+
+        # Keep correspondence soft so temperature actually controls the
+        # sharpness of cross-robot matching.
+        weights_ab = F.softmax(action_sim, dim=1)
+        weights_ba = F.softmax(action_sim.t(), dim=1)
+
+        aligned_delta_b = weights_ab @ delta_feat_b
+        aligned_delta_a = weights_ba @ delta_feat_a
+        aligned_delta_b = F.normalize(aligned_delta_b, p=2, dim=-1, eps=1e-8)
+        aligned_delta_a = F.normalize(aligned_delta_a, p=2, dim=-1, eps=1e-8)
+
+        loss_ab = 1.0 - F.cosine_similarity(delta_feat_a, aligned_delta_b, dim=-1).mean()
+        loss_ba = 1.0 - F.cosine_similarity(delta_feat_b, aligned_delta_a, dim=-1).mean()
+        return 0.5 * (loss_ab + loss_ba)
 
     # ---------- reward-bounds utilities ----------
     def set_reward_bounds(self, vmin: float, vmax: float):

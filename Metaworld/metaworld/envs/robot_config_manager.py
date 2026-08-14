@@ -12,7 +12,17 @@ import re
 from pathlib import Path
 from typing import Literal
 
-RobotType = Literal["sawyer", "kuka", "panda", "ur5e", "ur10e"]
+RobotType = Literal[
+    "sawyer",
+    "kuka",
+    "panda",
+    "ur5e",
+    "ur10e",
+    "gen3",
+    "xarm7",
+    "unitree_z1",
+    "viperx",
+]
 
 
 class RobotConfigManager:
@@ -25,6 +35,10 @@ class RobotConfigManager:
         "panda": "xyz_base_dependencies_panda.xml",
         "ur5e": "xyz_base_dependencies_ur5e.xml",
         "ur10e": "xyz_base_dependencies_ur10e.xml",
+        "gen3": "xyz_base_dependencies_gen3.xml",
+        "xarm7": "xyz_base_dependencies_xarm7.xml",
+        "unitree_z1": "xyz_base_dependencies_unitree.xml",
+        "viperx": "xyz_base_dependencies_viperx.xml",
     }
     
     ROBOT_BASE_FILES = {
@@ -33,6 +47,10 @@ class RobotConfigManager:
         "panda": "xyz_base_panda.xml",
         "ur5e": "xyz_base_ur5e.xml",
         "ur10e": "xyz_base_ur10e.xml",
+        "gen3": "xyz_base_gen3.xml",
+        "xarm7": "xyz_base_xarm7.xml",
+        "unitree_z1": "xyz_base_unitree.xml",
+        "viperx": "xyz_base_viperx.xml",
     }
     
     def __init__(self, assets_dir: str | Path | None = None):
@@ -52,6 +70,9 @@ class RobotConfigManager:
         self.assets_dir = Path(assets_dir)
         self.sawyer_xyz_dir = self.assets_dir / "sawyer_xyz"
         self.objects_assets_dir = self.assets_dir / "objects" / "assets"
+
+    def get_robot_base_xml_path(self, robot_type: RobotType) -> Path:
+        return self.objects_assets_dir / self.ROBOT_BASE_FILES[robot_type]
         
     def create_robot_specific_xml(
         self, 

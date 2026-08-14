@@ -96,6 +96,8 @@ class TransformerAgent:
             pretrained_dir = os.path.join(pretrained_dir, experiment, f"predictive_adapter_seed_{seed}")
             pretrained_step = pa_cfg_for_init.pop("pretrained_step", None)
             freeze_after_load = pa_cfg_for_init.pop("freeze_after_load", True)
+            pa_cfg_for_init.pop("delta_state_num_task_pairs", None)
+            pa_cfg_for_init.pop("delta_state_pair_batch_size", None)
             
             # 3. Always create the PredictiveAdapter instance first (using the clean config)
             self.predictive_adapter = PredictiveAdapter(
@@ -499,6 +501,72 @@ class TransformerAgent:
             return [self.log_alpha]
         return list(self._components[name].parameters())
 
+    def _prepare_predictive_adapter_batch_from_buffer(
+        self,
+        replay_buffer,
+        idxs=None,
+    ):
+        """Prepare either single-step or multi-step targets for predictive-adapter training."""
+        if idxs is None:
+            idxs = replay_buffer.sample_indices()
+
+        rollout_horizon = getattr(self.predictive_adapter, "rollout_horizon", 1) if self.predictive_adapter is not None else 1
+        valid_mask = None
+
+        if rollout_horizon > 1 and hasattr(replay_buffer, "sample_multi_step"):
+            states, actions, rewards, next_states, valid_mask, task_ids, task_encoding = replay_buffer.sample_multi_step(
+                rollout_horizon, index=idxs, device=self.device
+            )
+            next_states = _compress_meta_state(next_states)
+        else:
+            states, actions, rewards, next_states, _, _, _, task_ids, task_encoding = replay_buffer.sample_new(idxs)
+            next_states = _compress_meta_state(next_states)
+
+        if self.use_zeros:
+            task_encoding = torch.zeros((states.shape[0], self.cls_dim), device=self.device)
+        elif self.use_task_id:
+            task_encoding = task_ids.repeat(1, self.cls_dim)
+        elif self.use_cls_prediction_head:
+            states_seq, actions_seq, rewards_seq, _, _ = replay_buffer.build_sequences_for_indices(
+                idxs, self.seq_len, device=self.device
+            )
+            task_encoding = self.get_cls_encoding(
+                states=states_seq,
+                actions=actions_seq,
+                rewards=rewards_seq,
+                disable_grad=True,
+                mask=None,
+            )
+
+        return states, actions, rewards, next_states, task_ids, task_encoding, valid_mask, idxs
+
+    def _compute_delta_pair_loss(self, delta_pair_batches):
+        if (
+            self.predictive_adapter is None
+            or getattr(self.predictive_adapter, "delta_state_loss_weight", 0.0) <= 0.0
+            or len(delta_pair_batches) == 0
+        ):
+            return None
+
+        pair_losses = []
+        for pair_batch in delta_pair_batches:
+            pair_losses.append(
+                self.predictive_adapter.compute_delta_state_similarity_loss(
+                    state_a=pair_batch["state_a"],
+                    action_a=pair_batch["action_a"],
+                    next_state_a=pair_batch["next_state_a"],
+                    state_b=pair_batch["state_b"],
+                    action_b=pair_batch["action_b"],
+                    next_state_b=pair_batch["next_state_b"],
+                    valid_mask_a=pair_batch.get("valid_mask_a"),
+                    valid_mask_b=pair_batch.get("valid_mask_b"),
+                )
+            )
+
+        if not pair_losses:
+            return None
+        return torch.stack(pair_losses).mean()
+
     def distill_actor(
         self,
         replay_buffer_list: DistilledReplayBuffer,
@@ -698,49 +766,54 @@ class TransformerAgent:
         """
         if not self.use_predictive_adapter:
             return
-        # Sample data from replay buffer
+
         if isinstance(replay_buffer_list, list):
-            state_list, action_list, reward_list, next_state_list, task_encoding_list = [], [], [], [], []
+            state_list, action_list, reward_list, next_state_list = [], [], [], []
+            task_id_list, task_encoding_list, valid_mask_list = [], [], []
             for buffer in replay_buffer_list:
-                states, actions, rewards, next_states, _, _, _, _, encoding_sample = buffer.sample_new()
+                states, actions, rewards, next_states, task_ids, encoding_sample, valid_mask, _ = \
+                    self._prepare_predictive_adapter_batch_from_buffer(buffer)
                 state_list.append(states)
                 action_list.append(actions)
                 reward_list.append(rewards)
                 next_state_list.append(next_states)
+                task_id_list.append(task_ids)
                 task_encoding_list.append(encoding_sample)
+                if valid_mask is not None:
+                    valid_mask_list.append(valid_mask)
             states = torch.cat(state_list)
             actions = torch.cat(action_list)
             rewards = torch.cat(reward_list)
             next_states = torch.cat(next_state_list)
+            task_ids = torch.cat(task_id_list)
             task_encoding = torch.cat(task_encoding_list)
+            valid_mask = torch.cat(valid_mask_list) if valid_mask_list else None
         else:
-            idxs = replay_buffer_list.sample_indices()
-            states, actions, rewards, next_states, _, _, _, _, task_encoding = replay_buffer_list.sample_new(idxs)
-            next_states = _compress_meta_state(next_states)
-
-        if self.use_zeros:
-            task_encoding = torch.zeros((states.shape[0], self.cls_dim)).to(self.device)
-
-        elif self.use_cls_prediction_head:
-            states_seq, actions_seq, rewards_seq, current_state, _ = replay_buffer_list.build_sequences_for_indices(idxs, self.seq_len, device=self.device)
-            task_encoding = self.get_cls_encoding(
-                states=states_seq, actions=actions_seq, rewards=rewards_seq,
-                disable_grad=True, mask=None
-            )
+            states, actions, rewards, next_states, task_ids, task_encoding, valid_mask, idxs = \
+                self._prepare_predictive_adapter_batch_from_buffer(replay_buffer_list)
 
         if step == 0:  # Print only once
             print(f"[TA->pa/DEBUG] call compute_loss with:")
             print(f"  states{tuple(states.shape)} actions{tuple(actions.shape)} rewards{tuple(rewards.shape)}")
             print(f"  next_states{tuple(next_states.shape)} task_encoding{tuple(task_encoding.shape)}")
+            if valid_mask is not None:
+                print(f"  valid_mask{tuple(valid_mask.shape)}")
 
         # Compute predictive adapter losses
         dynamics_loss, reward_loss, total_loss = self.predictive_adapter.compute_loss(
             state=states,
             action=actions,
             next_state=next_states,
-            reward=rewards.unsqueeze(-1) if rewards.dim() == 1 else rewards,
+            reward=rewards,
             task_encoding=task_encoding,
+            valid_mask=valid_mask,
         )
+        delta_state_loss = torch.zeros((), device=states.device, dtype=states.dtype)
+        delta_pair_batches = kwargs.get("delta_pair_batches") or []
+        maybe_delta_loss = self._compute_delta_pair_loss(delta_pair_batches)
+        if maybe_delta_loss is not None:
+            delta_state_loss = maybe_delta_loss
+            total_loss = total_loss + self.predictive_adapter.delta_state_loss_weight * delta_state_loss
         # Optimize predictive adapter
         self._optimizers["predictive_adapter"].zero_grad()
         total_loss.backward()
@@ -749,6 +822,7 @@ class TransformerAgent:
         if kwargs.get('tb_log', False):
             logger.log("train/predictive_adapter_dynamics_loss", dynamics_loss.item(), step, tb_log=True)
             logger.log("train/predictive_adapter_reward_loss", reward_loss.item(), step, tb_log=True)
+            logger.log("train/predictive_adapter_delta_state_loss", delta_state_loss.item(), step, tb_log=True)
             logger.log("train/predictive_adapter_total_loss", total_loss.item(), step, tb_log=True)
 
 
@@ -768,7 +842,12 @@ class TransformerAgent:
         target_Q1, target_Q2 = self.critic_target(critic_input)
         return torch.min(target_Q1, target_Q2)
     
-    def evaluate_predictive_adapter_total(self, validation_buffer: DistilledReplayBuffer, batch_size: int = 512):
+    def evaluate_predictive_adapter_total(
+        self,
+        validation_buffer: DistilledReplayBuffer,
+        batch_size: int = 512,
+        delta_pair_batches=None,
+    ):
         """
         Evaluates the predictive adapter on a validation buffer.
         Iterates through the entire buffer, computes losses without backpropagation,
@@ -795,27 +874,15 @@ class TransformerAgent:
                 end_idx = min((i + 1) * batch_size, buffer_size)
                 idxs = np.arange(start_idx, end_idx)
 
-                # Use the same data sampling and preprocessing logic as during training
-                states, actions, rewards, next_states, _, _, _, task_ids, task_encoding = \
-                    validation_buffer.sample_new(idxs)
-                
-                # Recompute cls_token if needed (consistent with the logic in distill_actor)
-                if self.use_cls_prediction_head:
-                    states_seq, actions_seq, rewards_seq, _, _ = \
-                        validation_buffer.build_sequences_for_indices(idxs, self.seq_len, device=self.device)
-                    task_encoding = self.get_cls_encoding(
-                        states=states_seq, actions=actions_seq, rewards=rewards_seq,
-                        disable_grad=True, mask=None
-                    )
-                
-                # Call the predictive_adapter loss computation function
-                next_states = _compress_meta_state(next_states)
+                states, actions, rewards, next_states, _, task_encoding, valid_mask, _ = \
+                    self._prepare_predictive_adapter_batch_from_buffer(validation_buffer, idxs=idxs)
                 dynamics_loss, reward_loss, pa_total_loss = self.predictive_adapter.compute_loss(
                     state=states,
                     action=actions,
                     next_state=next_states,
-                    reward=rewards.unsqueeze(-1) if rewards.dim() == 1 else rewards,
-                    task_encoding=task_encoding
+                    reward=rewards,
+                    task_encoding=task_encoding,
+                    valid_mask=valid_mask,
                 )
                 
                 total_dynamics_loss += dynamics_loss.item()
@@ -826,16 +893,30 @@ class TransformerAgent:
         avg_dynamics_loss = total_dynamics_loss / num_batches
         avg_reward_loss = total_reward_loss / num_batches
         avg_total_loss = total_pa_loss / num_batches
+        avg_delta_state_loss = 0.0
+        maybe_delta_loss = self._compute_delta_pair_loss(delta_pair_batches or [])
+        if maybe_delta_loss is not None:
+            avg_delta_state_loss = maybe_delta_loss.item()
+            avg_total_loss += (
+                self.predictive_adapter.delta_state_loss_weight * avg_delta_state_loss
+            )
 
         self.predictive_adapter.train()
         
         return {
             "avg_dynamics_loss": avg_dynamics_loss,
             "avg_reward_loss": avg_reward_loss,
+            "avg_delta_state_loss": avg_delta_state_loss,
             "avg_total_loss": avg_total_loss,
         }
     
-    def evaluate_predictive_adapter(self, validation_buffer: DistilledReplayBuffer, batch_size: int = 512, max_batches: int = 100):
+    def evaluate_predictive_adapter(
+        self,
+        validation_buffer: DistilledReplayBuffer,
+        batch_size: int = 512,
+        max_batches: int = 100,
+        delta_pair_batches=None,
+    ):
         """
         Evaluate the Predictive Adapter on a validation set.
         For speed, randomly samples up to max_batches batches by default instead of iterating over the entire set.
@@ -882,28 +963,15 @@ class TransformerAgent:
                 if len(batch_idxs) == 0:
                     continue
 
-                # Data sampling
-                states, actions, rewards, next_states, _, _, _, task_ids, task_encoding = \
-                    validation_buffer.sample_new(batch_idxs)
-                
-                # Recompute cls_token (if needed)
-                if self.use_cls_prediction_head:
-                    states_seq, actions_seq, rewards_seq, _, _ = \
-                        validation_buffer.build_sequences_for_indices(batch_idxs, self.seq_len, device=self.device)
-                    task_encoding = self.get_cls_encoding(
-                        states=states_seq, actions=actions_seq, rewards=rewards_seq,
-                        disable_grad=True, mask=None
-                    )
-                
-                next_states = _compress_meta_state(next_states)
-                
-                # Compute loss
+                states, actions, rewards, next_states, _, task_encoding, valid_mask, _ = \
+                    self._prepare_predictive_adapter_batch_from_buffer(validation_buffer, idxs=batch_idxs)
                 dynamics_loss, reward_loss, pa_total_loss = self.predictive_adapter.compute_loss(
                     state=states,
                     action=actions,
                     next_state=next_states,
-                    reward=rewards.unsqueeze(-1) if rewards.dim() == 1 else rewards,
-                    task_encoding=task_encoding
+                    reward=rewards,
+                    task_encoding=task_encoding,
+                    valid_mask=valid_mask,
                 )
                 
                 total_dynamics_loss += dynamics_loss.item()
@@ -919,12 +987,20 @@ class TransformerAgent:
             avg_total_loss = total_pa_loss / num_batches
         else:
             avg_dynamics_loss = avg_reward_loss = avg_total_loss = 0.0
+        avg_delta_state_loss = 0.0
+        maybe_delta_loss = self._compute_delta_pair_loss(delta_pair_batches or [])
+        if maybe_delta_loss is not None:
+            avg_delta_state_loss = maybe_delta_loss.item()
+            avg_total_loss += (
+                self.predictive_adapter.delta_state_loss_weight * avg_delta_state_loss
+            )
 
         self.predictive_adapter.train()
         
         return {
             "avg_dynamics_loss": avg_dynamics_loss,
             "avg_reward_loss": avg_reward_loss,
+            "avg_delta_state_loss": avg_delta_state_loss,
             "avg_total_loss": avg_total_loss,
         }
     
@@ -1585,12 +1661,18 @@ def _get_step_from_model_path(_path: str) -> int:
     return int(_path.rsplit("/", 1)[-1].replace(".pt", "").rsplit("_", 1)[-1])
 
 def _compress_meta_state(x: torch.Tensor) -> torch.Tensor:
-    # x: [N, 39] or [N, 21]; idempotent processing
+    # x: [..., 39] or [..., 21]; idempotent processing on the last dimension
+    squeeze = False
     if x.dim() == 1:
         x = x.unsqueeze(0)
+        squeeze = True
     if x.size(-1) == 39:
-        # Keep only current timestep: 0:18 and 36:39 -> 18+3 = 21
-        return torch.cat([x[:, :18], x[:, 36:39]], dim=-1)
+        original_shape = x.shape[:-1]
+        x_flat = x.reshape(-1, 39)
+        x_flat = torch.cat([x_flat[:, :18], x_flat[:, 36:39]], dim=-1)
+        x = x_flat.view(*original_shape, 21)
+    if squeeze:
+        x = x.squeeze(0)
     return x
 
 
@@ -1639,7 +1721,7 @@ def _load_component_or_optimizer(
     path_to_load_from = f"{model_dir}/{name}_{step}.pt"
     print(f"path_to_load_from: {path_to_load_from}")
     if os.path.exists(path_to_load_from):
-        component_or_optimizer.load_state_dict(torch.load(path_to_load_from))
+        component_or_optimizer.load_state_dict(torch.load(path_to_load_from, weights_only=False))
     else:
         print(f"No component to load from {path_to_load_from}")
     return component_or_optimizer        

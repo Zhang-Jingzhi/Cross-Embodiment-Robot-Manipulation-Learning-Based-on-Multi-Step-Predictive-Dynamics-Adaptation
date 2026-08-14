@@ -523,6 +523,9 @@ class Experiment(checkpointable.Checkpointable):
                 seq_len=self.seq_len
             )
             self.replay_buffer_distill.load_multiple_buffer(buffer_dirs)
+            self.pa_task_pair_specs = self._build_pa_task_pair_specs(
+                self.replay_buffer_distill, buffer_dirs
+            )
 
             # 5) (Optional) Prepare a validation buffer for intermediate evaluation
             self.buffer_dir_val = [utils.make_dir(
@@ -538,6 +541,9 @@ class Experiment(checkpointable.Checkpointable):
                 seq_len=self.seq_len
             )
             self.replay_buffer_val.load_multiple_buffer(self.buffer_dir_val)
+            self.pa_val_task_pair_specs = self._build_pa_task_pair_specs(
+                self.replay_buffer_val, self.buffer_dir_val
+            )
 
             # 6) Starting step (optional resume)
             self.pa_start_step = 0
@@ -621,6 +627,108 @@ class Experiment(checkpointable.Checkpointable):
         config_file = f"{self.config.setup.save_dir}/config.json"
         with open(config_file, "w") as f:
             f.write(json.dumps(config_utils.to_dict(self.config)))
+
+    def _parse_collective_buffer_name(self, buffer_name: str) -> Optional[dict]:
+        prefix = "online_buffer_"
+        if not buffer_name.startswith(prefix):
+            return None
+        core = buffer_name[len(prefix):]
+        seed_marker = core.rfind("_seed_")
+        if seed_marker == -1:
+            return None
+        core = core[:seed_marker]
+        for task_name in sorted(self.task_names, key=len, reverse=True):
+            marker = f"_{task_name}"
+            if core.endswith(marker):
+                robot_name = core[:-len(marker)]
+                return {"robot": robot_name, "task": task_name}
+        return None
+
+    def _build_pa_task_pair_specs(self, replay_buffer, buffer_dirs: List[str]) -> dict:
+        task_groups = {}
+        source_ranges = getattr(replay_buffer, "source_ranges", {})
+        for buffer_dir in buffer_dirs:
+            meta = self._parse_collective_buffer_name(os.path.basename(buffer_dir))
+            range_info = source_ranges.get(str(buffer_dir))
+            if meta is None or range_info is None:
+                continue
+            spec = {
+                "robot": meta["robot"],
+                "task": meta["task"],
+                "start": int(range_info["start"]),
+                "end": int(range_info["end"]),
+                "size": int(range_info["size"]),
+            }
+            if spec["end"] <= spec["start"]:
+                continue
+            task_groups.setdefault(meta["task"], []).append(spec)
+        return {
+            task: specs for task, specs in task_groups.items() if len(specs) >= 2
+        }
+
+    def sample_pa_delta_pair_batches(self, replay_buffer=None, pair_specs=None):
+        if replay_buffer is None:
+            replay_buffer = getattr(self, "replay_buffer_distill", None)
+        if pair_specs is None:
+            pair_specs = getattr(self, "pa_task_pair_specs", {})
+        if replay_buffer is None or not pair_specs:
+            if replay_buffer is not None and not pair_specs:
+                if not getattr(self, "_warned_empty_pa_pair_specs", False):
+                    print(
+                        "[PA-DELTA/WARN] No task pair specs were built for delta-state loss. "
+                        "Delta loss will be skipped for this run."
+                    )
+                    self._warned_empty_pa_pair_specs = True
+            return []
+        pa_cfg = self.config.transformer_collective_network.predictive_adapter
+        loss_weight = float(pa_cfg.get("delta_state_loss_weight", 0.0))
+        if loss_weight <= 0.0:
+            return []
+
+        num_task_pairs = int(pa_cfg.get("delta_state_num_task_pairs", 4))
+        pair_batch_size = int(
+            pa_cfg.get(
+                "delta_state_pair_batch_size",
+                self.config.replay_buffer.transformer_col_replay_buffer.batch_size // 2,
+            )
+        )
+        eligible_tasks = list(pair_specs.keys())
+        if not eligible_tasks:
+            return []
+
+        chosen_tasks = random.sample(
+            eligible_tasks, k=min(num_task_pairs, len(eligible_tasks))
+        )
+        pair_batches = []
+        for task_name in chosen_tasks:
+            spec_a, spec_b = random.sample(pair_specs[task_name], 2)
+            idxs_a = np.random.randint(spec_a["start"], spec_a["end"], size=pair_batch_size)
+            idxs_b = np.random.randint(spec_b["start"], spec_b["end"], size=pair_batch_size)
+
+            state_a, action_a, _, next_state_a, _, _, valid_mask_a, _ = \
+                self.col_agent._prepare_predictive_adapter_batch_from_buffer(
+                    replay_buffer, idxs=idxs_a
+                )
+            state_b, action_b, _, next_state_b, _, _, valid_mask_b, _ = \
+                self.col_agent._prepare_predictive_adapter_batch_from_buffer(
+                    replay_buffer, idxs=idxs_b
+                )
+            pair_batches.append(
+                {
+                    "task": task_name,
+                    "robot_a": spec_a["robot"],
+                    "robot_b": spec_b["robot"],
+                    "state_a": state_a,
+                    "action_a": action_a,
+                    "next_state_a": next_state_a,
+                    "valid_mask_a": valid_mask_a,
+                    "state_b": state_b,
+                    "action_b": action_b,
+                    "next_state_b": next_state_b,
+                    "valid_mask_b": valid_mask_b,
+                }
+            )
+        return pair_batches
 
     def periodic_save(self, epoch: int) -> None:
         """Perioridically save the experiment.

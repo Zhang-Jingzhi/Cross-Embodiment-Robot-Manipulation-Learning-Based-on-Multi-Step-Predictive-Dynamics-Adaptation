@@ -10,6 +10,7 @@ from mtenv.envs.metaworld.wrappers.normalized_env import (  # type: ignore[attr-
     NormalizedEnvWrapper,
 )
 from mtenv.envs.shared.wrappers.multienv import MultiEnvWrapper
+from mtrl.env.perturbation_wrappers import apply_metaworld_perturbation_wrappers
 
 EnvBuilderType = Callable[[], Env]
 TaskStateType = int
@@ -51,6 +52,9 @@ def get_list_of_func_to_make_envs(
     should_perform_reward_normalization: bool = True,
     task_name: str = "pick-place-v1",
     num_copies_per_env: int = 1,
+    obs_noise_std: float = 0.0,
+    action_delay_steps: int = 0,
+    action_noise_std: float = 0.0,
 ) -> Tuple[List[Any], Dict[str, Any]]:
     """Return a list of functions to construct the MetaWorld environments
     and a mapping of environment ids to tasks.
@@ -130,6 +134,12 @@ def get_list_of_func_to_make_envs(
                     env.set_task(task)
                     if should_perform_reward_normalization:
                         env = NormalizedEnvWrapper(env, normalize_reward=True)
+                    env = apply_metaworld_perturbation_wrappers(
+                        env,
+                        obs_noise_std=obs_noise_std,
+                        action_delay_steps=action_delay_steps,
+                        action_noise_std=action_noise_std,
+                    )
                     return env
 
         return _make_env
@@ -155,6 +165,9 @@ def build(
     task_name: str = "pick-place-v1",
     num_copies_per_env: int = 1,
     initial_task_state: int = 1,
+    obs_noise_std: float = 0.0,
+    action_delay_steps: int = 0,
+    action_noise_std: float = 0.0,
 ) -> MTEnv:
     """Build a MTEnv comptaible variant of MetaWorld.
 
@@ -185,6 +198,9 @@ def build(
         should_perform_reward_normalization=should_perform_reward_normalization,
         task_name=task_name,
         num_copies_per_env=num_copies_per_env,
+        obs_noise_std=obs_noise_std,
+        action_delay_steps=action_delay_steps,
+        action_noise_std=action_noise_std,
     )
 
     assert env_id_to_task_map is not None
@@ -203,6 +219,9 @@ def get_list_of_envs(
     should_perform_reward_normalization: bool = True,
     task_name: str = "pick-place-v1",
     num_copies_per_env: int = 1,
+    obs_noise_std: float = 0.0,
+    action_delay_steps: int = 0,
+    action_noise_std: float = 0.0,
 ) -> Tuple[List[Any], Dict[str, Any]]:
 
     if not benchmark:
@@ -255,6 +274,12 @@ def get_list_of_envs(
                     env.set_task(task)
                     if should_perform_reward_normalization:
                         env = NormalizedEnvWrapper(env, normalize_reward=True)
+                    env = apply_metaworld_perturbation_wrappers(
+                        env,
+                        obs_noise_std=obs_noise_std,
+                        action_delay_steps=action_delay_steps,
+                        action_noise_std=action_noise_std,
+                    )
                     return env
         # modified return built single envs
         single_env = _make_env()
